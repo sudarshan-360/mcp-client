@@ -1,0 +1,27 @@
+# FastAPI + async server
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# Pydantic + settings
+pydantic==2.11.7
+pydantic-settings==2.7.1
+
+# MCP SDK (must match server's mcp version)
+mcp==1.27.0
+
+# LLM clients
+groq==0.12.0
+openai==1.57.0          # used for OpenRouter (OpenAI-compatible API)
+
+# HTTP
+httpx==0.28.1
+
+# MongoDB async driver
+motor==3.6.0
+pymongo==4.9.2
+
+# Qdrant (Phase 2 — RAG)
+qdrant-client==1.12.1
+
+# Utilities
+python-dotenv==1.0.1
