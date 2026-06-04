@@ -1,50 +1,50 @@
 """
-app/llm/groq_client.py
-──────────────────────
-Groq SDK wrapper with OpenRouter fallback.
-Both use the OpenAI-compatible chat completions API,
-so the same call signature works for both.
+app/llm/groq_client.py — REFACTORED
+────────────────────────────────────
+Removed: Tool-selection logic (chat_with_tools)
+Kept: stream_answer (now used for formatting tool output)
+Added: format_tool_output (specialized for explaining MCP results)
 """
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, AsyncIterator
 
-import httpx
-from openai import AsyncOpenAI          # Groq uses openai-compatible SDK
 from groq import AsyncGroq
+from openai import AsyncOpenAI
 
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are an expert oncology clinical decision support assistant.
+# ──────────────────────────────────────────────────────────────────────────────
+# System prompts (specialized)
+# ──────────────────────────────────────────────────────────────────────────────
 
-Your job is to collect the clinical parameters needed to call the appropriate
-oncology decision-support tool, then present the tool's recommendation clearly.
+_FORMAT_SYSTEM_PROMPT = """You are a medical report formatter.
 
-Available cancer sites and their tools:
-- Cervical cancer         → cervix_cancer
-- Head & Neck SCC         → hnscc_decision
-- Breast cancer           → breast_cancer
-- Prostate cancer         → gu_prostate
-- Bladder cancer          → gu_bladder
-- Testicular cancer       → gu_testicular
-- GI cancers (esophagus/stomach/rectum/anal/pancreas/colon) → gi_cancer
-- Lymphoma                → lymphoma
-- CNS tumours             → cns_tumor
+CRITICAL RULES:
 
-Rules:
-1. If the user's query already contains enough parameters, call the tool immediately.
-2. If parameters are missing, ask for them clearly and specifically.
-3. After receiving tool output, present it clearly with key treatment highlights.
-4. Always end with: "⚠ This is decision-support only. All recommendations require clinical judgment and MDT discussion where indicated."
-5. Never invent clinical parameters — only use what the user provides.
+1. Preserve every line exactly.
+2. Preserve every recommendation exactly.
+3. Preserve every dose exactly.
+4. Preserve every stage exactly.
+5. Preserve every protocol exactly.
+6. Do not summarize.
+7. Do not explain.
+8. Do not infer.
+9. Do not rewrite clinical content.
+10. Convert only to markdown formatting.
+
+Return the content with identical medical meaning and wording.
 """
 
 
 class LLMClient:
+    """
+    REFACTORED: No tool selection. Only for formatting/explaining tool output.
+    """
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._groq: AsyncGroq | None = None
@@ -61,7 +61,7 @@ class LLMClient:
             )
             logger.info("LLM: using OpenRouter model '%s'", settings.openrouter_model)
         else:
-            logger.warning("No LLM API key configured — tool calls will fail.")
+            logger.warning("No LLM API key configured — formatting will fail.")
 
     @property
     def model_name(self) -> str:
@@ -69,85 +69,44 @@ class LLMClient:
             return self._settings.groq_model
         return self._settings.openrouter_model
 
-    # ── Non-streaming (tool-call loop) ────────────────────────────────────────
+    # ── Format tool output for presentation ────────────────────────────────────
 
-    async def chat_with_tools(
+    async def format_tool_output(
         self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """
-        Single non-streaming call.  Returns the raw message dict from the API
-        (may contain tool_calls or plain content).
-        """
-        full_messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + messages
-
-        if self._groq:
-            response = await self._groq.chat.completions.create(
-                model=self._settings.groq_model,
-                messages=full_messages,
-                tools=tools if tools else None,
-                tool_choice="auto" if tools else None,
-                max_tokens=512,
-                temperature=0.1,
-            )
-        elif self._openrouter:
-            response = await self._openrouter.chat.completions.create(
-                model=self._settings.openrouter_model,
-                messages=full_messages,
-                tools=tools if tools else None,
-                tool_choice="auto" if tools else None,
-                max_tokens=512,
-                temperature=0.1,
-            )
-        else:
-            raise RuntimeError("No LLM client configured.")
-
-        choice = response.choices[0]
-        msg = choice.message
-
-        # Normalise to plain dict for the orchestrator
-        result: dict[str, Any] = {
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": [],
-        }
-
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-
-                result["tool_calls"].append({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-
-                        # IMPORTANT:
-                        # Keep arguments as RAW JSON STRING
-                        # Do NOT json.loads() here
-                        "arguments": tc.function.arguments,
-                    },
-                })
-
-        return result
-
-    # ── Streaming (final answer only, after tool-call loop) ──────────────────
-
-    async def stream_answer(
-        self,
-        messages: list[dict[str, Any]],
+        tool_output: str,
+        cancer_type: str,
+        patient_context: str = "",
     ) -> AsyncIterator[str]:
         """
-        Stream the final assistant answer token-by-token.
-        Call this AFTER the tool-call loop has finished and
-        `messages` contains all tool results.
+        Stream formatted explanation of the MCP tool output.
+        
+        Args:
+            tool_output: Raw output from MCP tool (treatment recommendation)
+            cancer_type: Type of cancer (for context)
+            patient_context: Optional additional clinical context
+        
+        Yields:
+            Formatted tokens one by one
         """
-        full_messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + messages
+        
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    f"Please present this {cancer_type} cancer decision-support output "
+                    f"clearly and professionally.\n\n"
+                    f"Tool output:\n{tool_output}"
+                    + (f"\n\nAdditional context: {patient_context}" if patient_context else "")
+                ),
+            }
+        ]
 
         if self._groq:
             stream = await self._groq.chat.completions.create(
                 model=self._settings.groq_model,
-                messages=full_messages,
+                messages=[
+                    {"role": "system", "content": _FORMAT_SYSTEM_PROMPT}
+                ] + messages,
                 stream=True,
                 max_tokens=512,
                 temperature=0.1,
@@ -155,7 +114,47 @@ class LLMClient:
         elif self._openrouter:
             stream = await self._openrouter.chat.completions.create(
                 model=self._settings.openrouter_model,
-                messages=full_messages,
+                messages=[
+                    {"role": "system", "content": _FORMAT_SYSTEM_PROMPT}
+                ] + messages,
+                stream=True,
+                max_tokens=512,
+                temperature=0.1,
+            )
+        else:
+            raise RuntimeError("No LLM client configured.")
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+
+    # ── Fallback: Direct streaming (if LLM fails) ──────────────────────────────
+
+    async def stream_answer(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> AsyncIterator[str]:
+        """
+        General streaming for any message list.
+        Used as fallback if format_tool_output needs more control.
+        """
+        if self._groq:
+            stream = await self._groq.chat.completions.create(
+                model=self._settings.groq_model,
+                messages=[
+                    {"role": "system", "content": _FORMAT_SYSTEM_PROMPT}
+                ] + messages,
+                stream=True,
+                max_tokens=512,
+                temperature=0.1,
+            )
+        elif self._openrouter:
+            stream = await self._openrouter.chat.completions.create(
+                model=self._settings.openrouter_model,
+                messages=[
+                    {"role": "system", "content": _FORMAT_SYSTEM_PROMPT}
+                ] + messages,
                 stream=True,
                 max_tokens=512,
                 temperature=0.1,

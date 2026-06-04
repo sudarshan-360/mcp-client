@@ -1,16 +1,19 @@
 """
-app/llm/orchestrator.py
-───────────────────────
-Agentic orchestration loop.
+app/llm/orchestrator.py — REFACTORED
+─────────────────────────────────────
+ARCHITECTURE CHANGE:
+  OLD: LLM decides tool → Call tool → LLM formats answer
+  NEW: Deterministic route → Call tool directly → LLM formats only
 
-Flow:
-  1. Build message history from session
-  2. Call LLM with MCP tools in context
-  3. If LLM wants a tool → call MCP, append result, loop
-  4. When LLM produces a final text answer → stream it to the client
-  5. Persist updated history to session store
+Removes:
+  - chat_with_tools() calls (no LLM tool selection)
+  - Tool-call loop (no iterations)
+  - Tool definition passing to LLM
 
-Yields SSEEvent objects that the route handler converts to SSE text.
+Adds:
+  - get_tool_name() from tool_router
+  - Direct MCP tool execution
+  - format_tool_output() for presentation only
 """
 
 from __future__ import annotations
@@ -22,8 +25,10 @@ from typing import Any, AsyncIterator
 
 from app.config import Settings
 from app.llm.groq_client import LLMClient
-from app.mcp.manager import call_tool, list_tools
+from app.mcp.manager import call_tool
+from app.core.tool_router import get_tool_name, validate_cancer_type
 from app.models.chat import (
+    ClinicalParameters,
     Message,
     Role,
     SSEEvent,
@@ -33,407 +38,206 @@ from app.models.chat import (
 
 logger = logging.getLogger(__name__)
 
-# Prevent token explosion
-MAX_TOOL_CONTENT = 250
-
 
 class Orchestrator:
+    """
+    SIMPLIFIED: No agentic loop, no LLM tool selection.
+    
+    Flow:
+      1. Validate cancer_type → get tool name (deterministic)
+      2. Call MCP tool directly with patient_data
+      3. Stream LLM-formatted explanation
+      4. Done
+    """
 
     def __init__(
         self,
         settings: Settings,
         llm: LLMClient,
     ) -> None:
-
         self._settings = settings
         self._llm = llm
 
     async def run(
         self,
-        user_message: str,
-        history: list[Message],
+        cancer_type: str,
+        patient_data: dict[str, Any] | ClinicalParameters,
+        request_context: str | None = None,
     ) -> AsyncIterator[SSEEvent]:
+        """
+        Direct, deterministic clinical decision-support flow.
+        
+        Args:
+            cancer_type: Type of cancer (e.g., "breast", "cervical")
+            patient_data: Structured clinical parameters
+            request_context: Optional additional context for LLM
+        
+        Yields:
+            SSEEvent objects for streaming to frontend
+        """
 
-        # ─────────────────────────────────────────────
-        # Build conversation
-        # ─────────────────────────────────────────────
+        # ───────────────────────────────────────────────────────────────────────
+        # Step 1: Validate cancer type and get tool name
+        # ───────────────────────────────────────────────────────────────────────
 
-        working: list[dict[str, Any]] = (
-            self._history_to_api_format(history)
+        try:
+            validated_cancer_type = validate_cancer_type(cancer_type)
+            logger.info(f"Cancer type validated: {validated_cancer_type}")
+        except ValueError as e:
+            yield SSEEvent(
+                event=SSEEventType.ERROR,
+                data=json.dumps({"error": str(e)}),
+            )
+            return
+
+        try:
+            tool_name = get_tool_name(validated_cancer_type)
+            logger.info(f"Determined tool: {tool_name}")
+        except ValueError as e:
+            yield SSEEvent(
+                event=SSEEventType.ERROR,
+                data=json.dumps({"error": str(e)}),
+            )
+            return
+
+        # ───────────────────────────────────────────────────────────────────────
+        # Step 2: Prepare arguments for MCP tool
+        # ───────────────────────────────────────────────────────────────────────
+
+        if isinstance(patient_data, ClinicalParameters):
+            arguments = patient_data.model_dump(exclude_none=True)
+        else:
+            arguments = {k: v for k, v in patient_data.items() if v is not None}
+
+        logger.debug(f"Tool arguments: {len(arguments)} fields")
+
+        # ───────────────────────────────────────────────────────────────────────
+        # Step 3: Call MCP tool directly (NO LLM INVOLVED YET)
+        # ───────────────────────────────────────────────────────────────────────
+
+        yield SSEEvent(
+            event=SSEEventType.TOOL_CALL_START,
+            data=json.dumps({
+                "tool": tool_name,
+                "cancer_type": cancer_type,
+                "param_count": len(arguments),
+            }),
         )
 
-        working.append({
-            "role": "user",
-            "content": user_message,
-        })
+        tool_output = ""
+        tool_error = None
 
-        # ─────────────────────────────────────────────
-        # Load tools
-        # ─────────────────────────────────────────────
+        try:
+            logger.info(f"Calling MCP tool: {tool_name}")
+            '''
+            print("\n" + "=" * 80)
+            print("TOOL NAME:", tool_name)
+            print("TOOL INPUT:")
+            print(json.dumps(arguments, indent=2))
+            print("=" * 80 + "\n")
+            '''
+            tool_output = await call_tool(tool_name, arguments)
+            print("\n" + "=" * 80)
+            print("RAW MCP OUTPUT")
+            print("=" * 80)
+            print(tool_output)
+            print("=" * 80)
+            '''
+            print("\n" + "=" * 80)
+            print("TOOL OUTPUT:")
+            print(tool_output)
+            print("=" * 80 + "\n")
+            '''
+            logger.debug(f"Tool returned {len(tool_output)} chars")
 
-        tools = await list_tools()
-
-        tool_calls_made: list[ToolCallInfo] = []
-
-        iteration = 0
-        max_iter = self._settings.max_tool_iterations
-
-        # ─────────────────────────────────────────────
-        # Tool loop
-        # ─────────────────────────────────────────────
-
-        while iteration < max_iter:
-
-            iteration += 1
-
-            logger.debug(
-                "Orchestrator iteration %d",
-                iteration,
+        except Exception as exc:
+            tool_error = str(exc)
+            logger.error(f"Tool execution failed: {exc}")
+            yield SSEEvent(
+                event=SSEEventType.ERROR,
+                data=json.dumps({
+                    "error": f"Tool execution failed: {exc}",
+                    "tool": tool_name,
+                }),
             )
+            return
 
-            response_msg = await self._llm.chat_with_tools(
-                working,
-                tools,
-            )
+        # ───────────────────────────────────────────────────────────────────────
+        # Step 4: Emit tool result
+        # ───────────────────────────────────────────────────────────────────────
 
-            # ─────────────────────────────────────────
-            # Final answer (no tool calls)
-            # ─────────────────────────────────────────
-
-            if not response_msg.get("tool_calls"):
-
-                working.append({
-                    "role": "assistant",
-                    "content": response_msg.get("content", ""),
-                })
-
-                break
-
-            # ─────────────────────────────────────────
-            # Convert tool arguments to JSON STRINGS
-            # Required by Groq/OpenAI APIs
-            # ─────────────────────────────────────────
-
-            assistant_tool_message = {
-                "role": "assistant",
-                "content": response_msg.get("content", ""),
-                "tool_calls": [],
-            }
-
-            for tc in response_msg["tool_calls"]:
-
-                fn = tc["function"]
-
-                arguments_raw = fn["arguments"]
-
-                # MUST be JSON string
-                if isinstance(arguments_raw, dict):
-
-                    arguments_str = json.dumps(arguments_raw)
-
-                else:
-
-                    arguments_str = arguments_raw
-
-                assistant_tool_message["tool_calls"].append({
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": fn["name"],
-                        "arguments": arguments_str,
-                    },
-                })
-
-            # Save assistant tool-call message
-            working.append(assistant_tool_message)
-
-            # ─────────────────────────────────────────
-            # Execute tool calls
-            # ─────────────────────────────────────────
-
-            for tc in response_msg["tool_calls"]:
-
-                fn = tc["function"]
-
-                tool_name = fn["name"]
-
-                arguments_raw = fn["arguments"]
-
-                tc_id = tc["id"]
-
-                # Parse arguments back to dict
-                if isinstance(arguments_raw, str):
-
-                    try:
-
-                        arguments = json.loads(arguments_raw)
-
-                    except Exception:
-
-                        arguments = {}
-
-                else:
-
-                    arguments = arguments_raw
-
-                # ─────────────────────────────────────
-                # Emit tool start
-                # ─────────────────────────────────────
-
-                yield SSEEvent(
-                    event=SSEEventType.TOOL_CALL_START,
-                    data=json.dumps({
-                        "tool": tool_name,
-                        "args_preview": _summarise_args(
-                            arguments
-                        ),
-                    }),
-                )
-
-                # ─────────────────────────────────────
-                # Execute MCP tool
-                # ─────────────────────────────────────
-
-                try:
-
-                    result_text = await call_tool(
-                        tool_name,
-                        arguments,
-                    )
-
-                    tool_info = ToolCallInfo(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                        result=result_text,
-                    )
-
-                except Exception as exc:
-
-                    result_text = (
-                        f"ERROR calling {tool_name}: {exc}"
-                    )
-
-                    tool_info = ToolCallInfo(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                        error=str(exc),
-                    )
-
-                tool_calls_made.append(tool_info)
-
-                # ─────────────────────────────────────
-                # Emit tool result preview
-                # ─────────────────────────────────────
-
-                yield SSEEvent(
-                    event=SSEEventType.TOOL_CALL_RESULT,
-                    data=json.dumps({
-                        "tool": tool_name,
-                        "result_preview": (
-                            result_text[:200] + "…"
-                            if len(result_text) > 200
-                            else result_text
-                        ),
-                    }),
-                )
-
-                # ─────────────────────────────────────
-                # COMPRESS TOOL OUTPUT
-                # Prevent TPM/token overflow
-                # ─────────────────────────────────────
-
-                tool_content = compress_tool_output(
-                    result_text,
-                    MAX_TOOL_CONTENT,
-                )
-
-                # ─────────────────────────────────────
-                # Append tool result
-                # ─────────────────────────────────────
-
-                working.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": tool_content,
-                })
-
-        # ─────────────────────────────────────────────
-        # Max iteration safety
-        # ─────────────────────────────────────────────
-
-        else:
-
-            logger.warning(
-                "Orchestrator hit max iterations (%d)",
-                max_iter,
-            )
-
-            working.append({
-                "role": "assistant",
-                "content": (
-                    "I've gathered clinical information "
-                    "from the decision-support tools. "
-                    "Please ask me to summarise or clarify "
-                    "any aspect of the recommendation."
+        yield SSEEvent(
+            event=SSEEventType.TOOL_CALL_RESULT,
+            data=json.dumps({
+                "tool": tool_name,
+                "result_preview": (
+                    tool_output[:300] + "…"
+                    if len(tool_output) > 300
+                    else tool_output
                 ),
-            })
+            }),
+        )
 
-        # ─────────────────────────────────────────────
-        # Stream final answer
-        # ─────────────────────────────────────────────
+        # ───────────────────────────────────────────────────────────────────────
+        # Step 5: Stream LLM-formatted explanation (ONLY FOR PRESENTATION)
+        # ───────────────────────────────────────────────────────────────────────
 
         final_content_parts: list[str] = []
+        buffer = ""
 
-        async for token in self._llm.stream_answer(working):
+        try:
+            async for token in self._llm.format_tool_output(
+                tool_output=tool_output,
+                cancer_type=cancer_type,
+                patient_context=request_context or "",
+            ):
+                final_content_parts.append(token)
+                buffer += token
 
-            final_content_parts.append(token)
+                if (
+                    len(buffer) >= 100
+                    or token.endswith(".")
+                    or token.endswith("\n")
+                    or token.endswith(":")
+                ):
+                    yield SSEEvent(
+                        event=SSEEventType.TEXT_DELTA,
+                        data=buffer,
+                    )
+                    buffer = ""
 
+                if self._settings.stream_chunk_delay > 0:
+                    await asyncio.sleep(self._settings.stream_chunk_delay)
+
+            if buffer:
+                yield SSEEvent(
+                    event=SSEEventType.TEXT_DELTA,
+                    data=buffer,
+                )
+        except Exception as exc:
+            logger.error(f"LLM formatting failed: {exc}")
+            # Fallback: emit raw tool output
             yield SSEEvent(
                 event=SSEEventType.TEXT_DELTA,
-                data=token,
+                data=tool_output,
             )
+            final_content_parts = [tool_output]
 
-            if self._settings.stream_chunk_delay > 0:
-
-                await asyncio.sleep(
-                    self._settings.stream_chunk_delay
-                )
+        # ───────────────────────────────────────────────────────────────────────
+        # Step 6: Final done event with summary
+        # ───────────────────────────────────────────────────────────────────────
 
         final_content = "".join(final_content_parts)
-
-        # ─────────────────────────────────────────────
-        # Done event
-        # ─────────────────────────────────────────────
 
         yield SSEEvent(
             event=SSEEventType.DONE,
             data=json.dumps({
-                "tool_calls": [
-                    tc.model_dump()
-                    for tc in tool_calls_made
-                ],
-                "iteration_count": iteration,
+                "tool_name": tool_name,
+                "cancer_type": cancer_type,
+                "parameters_sent": len(arguments),
+                "tool_output_chars": len(tool_output),
+                "formatted_output_chars": len(final_content),
+                "error": tool_error,
                 "model": self._llm.model_name,
-                "final_message": final_content,
             }),
         )
-
-    # ─────────────────────────────────────────────────
-    # Helpers
-    # ─────────────────────────────────────────────────
-
-    @staticmethod
-    def _history_to_api_format(
-        history: list[Message],
-    ) -> list[dict[str, Any]]:
-
-        result: list[dict[str, Any]] = []
-
-        for msg in history:
-
-            if msg.role == Role.USER:
-
-                result.append({
-                    "role": "user",
-                    "content": msg.content,
-                })
-
-            elif msg.role == Role.ASSISTANT:
-
-                result.append({
-                    "role": "assistant",
-                    "content": msg.content,
-                })
-
-            elif msg.role == Role.TOOL:
-
-                result.append({
-                    "role": "tool",
-                    "tool_call_id": (
-                        msg.tool_call_id or ""
-                    ),
-                    "content": msg.content,
-                })
-
-        return result
-
-
-def compress_tool_output(
-    text: str,
-    limit: int,
-) -> str:
-
-    # Remove markdown/code fences
-    text = text.replace("```", "")
-
-    # Remove bullets and extra spacing
-    lines = []
-
-    for line in text.splitlines():
-
-        line = line.strip()
-
-        if not line:
-            continue
-
-        # Skip decorative separators
-        if set(line) <= {"-", "="}:
-            continue
-
-        lines.append(line)
-
-    # Keep VERY SMALL context
-    compact = "\n".join(lines[:12])
-
-    # Hard truncate
-    compact = compact[:limit]
-
-    return compact
-
-
-def _summarise_args(args: Any) -> str:
-
-    if isinstance(args, str):
-
-        try:
-
-            args = json.loads(args)
-
-        except Exception:
-
-            return args[:120]
-
-    important = {
-        k: v
-        for k, v in args.items()
-        if v is not None and k in (
-            "age",
-            "primary_site",
-            "figo_stage",
-            "ajcc_stage",
-            "overall_stage",
-            "t_stage",
-            "n_stage",
-            "m_stage",
-            "histology",
-            "er_status",
-            "pr_status",
-            "her2_status",
-            "subtype",
-            "who_grade",
-            "tumour_type",
-        )
-    }
-
-    if not important:
-
-        important = {
-            k: v
-            for k, v in list(args.items())[:3]
-            if v is not None
-        }
-
-    return ", ".join(
-        f"{k}={v}"
-        for k, v in important.items()
-    )
