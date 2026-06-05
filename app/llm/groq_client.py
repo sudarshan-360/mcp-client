@@ -4,6 +4,7 @@ app/llm/groq_client.py — REFACTORED
 Removed: Tool-selection logic (chat_with_tools)
 Kept: stream_answer (now used for formatting tool output)
 Added: format_tool_output (specialized for explaining MCP results)
+Enhanced: stream_answer now supports custom system prompts for case-aware follow-ups
 """
 from __future__ import annotations
 
@@ -43,6 +44,7 @@ Return the content with identical medical meaning and wording.
 class LLMClient:
     """
     REFACTORED: No tool selection. Only for formatting/explaining tool output.
+    Enhanced with support for custom system prompts for case-aware responses.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -129,21 +131,34 @@ class LLMClient:
             if delta.content:
                 yield delta.content
 
-    # ── Fallback: Direct streaming (if LLM fails) ──────────────────────────────
+    # ── General streaming with custom system prompt ─────────────────────────────
 
     async def stream_answer(
         self,
         messages: list[dict[str, Any]],
+        system_prompt: str | None = None,
     ) -> AsyncIterator[str]:
         """
-        General streaming for any message list.
-        Used as fallback if format_tool_output needs more control.
+        General streaming for any message list with optional custom system prompt.
+        
+        Used for:
+        - Fallback if format_tool_output needs more control
+        - Case-constrained follow-up questions
+        
+        Args:
+            messages: List of message dicts with role and content
+            system_prompt: Custom system prompt (defaults to _FORMAT_SYSTEM_PROMPT)
+        
+        Yields:
+            Response tokens one by one
         """
+        system = system_prompt or _FORMAT_SYSTEM_PROMPT
+        
         if self._groq:
             stream = await self._groq.chat.completions.create(
                 model=self._settings.groq_model,
                 messages=[
-                    {"role": "system", "content": _FORMAT_SYSTEM_PROMPT}
+                    {"role": "system", "content": system}
                 ] + messages,
                 stream=True,
                 max_tokens=512,
@@ -153,7 +168,7 @@ class LLMClient:
             stream = await self._openrouter.chat.completions.create(
                 model=self._settings.openrouter_model,
                 messages=[
-                    {"role": "system", "content": _FORMAT_SYSTEM_PROMPT}
+                    {"role": "system", "content": system}
                 ] + messages,
                 stream=True,
                 max_tokens=512,

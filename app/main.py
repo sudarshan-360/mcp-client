@@ -1,5 +1,7 @@
 """
-app/main.py — FastAPI application entry point
+app/main.py — UPDATED
+──────────────────────
+Includes new chat_extended and follow_up routes for multi-turn conversations.
 """
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.db.mongo import close_db, connect_db
 from app.mcp.manager import start_mcp, stop_mcp
-from app.api.routes import chat, health, tools
+from app.api.routes import chat, health, tools, chat_extended, follow_up
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,9 +53,10 @@ def create_app() -> FastAPI:
         title="Oncology Decision Support API",
         description=(
             "AI-powered clinical decision support for 9 cancer sites. "
-            "Decision-support only — all outputs require clinical judgment."
+            "Initial decision-support + multi-turn case-constrained conversations. "
+            "All outputs require clinical judgment."
         ),
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
         docs_url="/docs",
         redoc_url="/redoc",
@@ -71,7 +74,13 @@ def create_app() -> FastAPI:
     # Routes
     app.include_router(health.router, tags=["system"])
     app.include_router(tools.router, tags=["tools"])
+    
+    # Original chat route (keep for backwards compatibility)
     app.include_router(chat.router, tags=["chat"])
+    
+    # NEW: Enhanced chat with case context + follow-up support
+    app.include_router(chat_extended.router, tags=["chat"])
+    app.include_router(follow_up.router, tags=["chat"])
 
     return app
 
